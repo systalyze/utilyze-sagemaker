@@ -1,0 +1,7 @@
+embedded/
+!internal/ffi/sampler/embedded/
+internal/ffi/sampler/embedded/*
+!internal/ffi/sampler/embedded/.keep
+dist/
+
+.DS_Store
