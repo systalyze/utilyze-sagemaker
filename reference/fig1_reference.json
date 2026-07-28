@@ -1,0 +1,13 @@
+{
+  "_comment": "Report Fig-1 values. measured_* from the July 2026 A100 runs (steady-window means over utlz Valid frames); attainable ceilings computed by the prediction engine for Gemma-4-31B-IT-NVFP4 (bf16 KV) on A100-SXM4-80GB, per workload.",
+  "hardware": "1x NVIDIA A100-SXM4-80GB per workload",
+  "model": "nvidia/Gemma-4-31B-IT-NVFP4 (KV cache in bf16, see scripts/prep_model.py)",
+  "vllm": "0.21.0",
+  "cells": {
+    "decode-b16":  {"isl": 128,  "osl": 1024, "concurrency": 16, "measured_compute_sol": 22.7, "measured_memory_sol": 58.3, "measured_otps": 445.3, "attainable_compute_sol": 23.7},
+    "decode-b64":  {"isl": 128,  "osl": 1024, "concurrency": 64, "measured_compute_sol": 28.7, "measured_memory_sol": 54.2, "measured_otps": 887.9, "attainable_compute_sol": 44.0},
+    "bal512-b32":  {"isl": 512,  "osl": 512,  "concurrency": 32, "measured_compute_sol": 29.2, "measured_memory_sol": 53.7, "measured_otps": 559.8, "attainable_compute_sol": 52.6},
+    "bal2048-b32": {"isl": 2048, "osl": 128,  "concurrency": 32, "measured_compute_sol": 45.7, "measured_memory_sol": 35.6, "measured_otps": 129.5, "attainable_compute_sol": 96.1},
+    "prefill-b32": {"isl": 4800, "osl": 32,   "concurrency": 32, "measured_compute_sol": 48.1, "measured_memory_sol": 30.6, "measured_otps": 15.7,  "attainable_compute_sol": 97.1}
+  }
+}

@@ -1,0 +1,182 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Create a GitHub release (uses version from VERSION file)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (with native) linux (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    env:
+      DOCKER_BUILD_SUMMARY: 'false'
+      DOCKER_BUILD_RECORD_UPLOAD: 'false'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read version
+        id: version
+        run: |
+          v=$(cat VERSION)
+          echo "version=$v"     >> "$GITHUB_OUTPUT"
+          echo "major=${v%%.*}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build libutlz_sampler
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          target: export
+          outputs: type=local,dest=./out
+          cache-from: type=gha,scope=native-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=native-${{ matrix.arch }}
+
+      - name: Extract and copy native lib
+        id: extract-native-lib
+        env:
+          MAJOR: ${{ steps.version.outputs.major }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          tar xzf out/libutlz_sampler-*.tar.gz -C out
+          src="$(find out -name 'libutlz_sampler.so.*' ! -type l | head -1)"
+          mkdir -p internal/ffi/sampler/embedded
+          install -m 0644 "$src" "internal/ffi/sampler/embedded/libutlz_sampler.so.${MAJOR}"
+          echo "SHA256SUM=$(sha256sum "$src" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build utlz
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256SUM: ${{ steps.extract-native-lib.outputs.SHA256SUM }}
+          REPO: ${{ github.repository }}
+        run: |
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X github.com/systalyze/utilyze/internal/version.VERSION=${VERSION} -X github.com/systalyze/utilyze/internal/ffi/sampler.SHA256SUM=${SHA256SUM} -X github.com/systalyze/utilyze/internal/version.REPO=${REPO}" \
+            -o "out/utlz-linux-${GOARCH}" \
+            ./cmd
+
+      - name: Upload libutlz_sampler tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: libutlz_sampler-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}
+          path: out/libutlz_sampler-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload utlz binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: utlz-linux-${{ matrix.arch }}
+          path: out/utlz-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  build-go:
+    name: Build ${{ matrix.goos }} (${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin, goarch: amd64, ext: '' }
+          - { goos: darwin, goarch: arm64, ext: '' }
+          - { goos: windows, goarch: amd64, ext: '.exe' }
+          - { goos: windows, goarch: arm64, ext: '.exe' }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read version
+        id: version
+        run: |
+          v=$(cat VERSION)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build utlz
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REPO: ${{ github.repository }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          make utlz GOOS="$GOOS" GOARCH="$GOARCH" VERSION="$VERSION" REPO="$REPO"
+          mkdir -p out
+          mv "dist/utlz-${GOOS}-${GOARCH}" "out/utlz-${GOOS}-${GOARCH}${EXT}"
+
+      - name: Upload utlz binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: utlz-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: out/utlz-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [build, build-go]
+    if: github.event.inputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve tag and check it does not exist
+        id: tag
+        run: |
+          tag="v$(cat VERSION)"
+          if git ls-remote --tags origin "$tag" | grep -q "refs/tags/$tag$"; then
+            echo "ERROR: tag $tag already exists. Bump VERSION before releasing." >&2
+            exit 1
+          fi
+          echo "tag=$tag"             >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}"     >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist/
+          pattern: '{libutlz_sampler-*,utlz-linux-*,utlz-darwin-*,utlz-windows-*}'
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum libutlz_sampler-*.tar.gz utlz-linux-* utlz-darwin-* utlz-windows-* > sha256sums.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --title "utlz ${{ steps.tag.outputs.version }}" \
+            --generate-notes \
+            dist/libutlz_sampler-*.tar.gz \
+            dist/utlz-linux-* \
+            dist/utlz-darwin-* \
+            dist/utlz-windows-* \
+            dist/sha256sums.txt

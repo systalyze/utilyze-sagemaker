@@ -1,0 +1,437 @@
+package metrics
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"math"
+	"net/http"
+	"os"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/systalyze/utilyze/internal/inference"
+)
+
+const (
+	DefaultBackendURL = "https://api.systalyze.com/v1/utilyze"
+	backendURLEnvVar  = "UTLZ_BACKEND_URL"
+	disableEnvVar     = "UTLZ_DISABLE_METRICS"
+
+	// scrapeBudget bounds total vLLM /metrics scraping per 5s tick.
+	scrapeBudget = 2500 * time.Millisecond
+)
+
+type GpuCeiling struct {
+	Index             int
+	ModelName         *string
+	ComputeSolCeiling *float64
+}
+
+type CeilingCallback func(perGPU map[int]GpuCeiling)
+
+type ReporterConfig struct {
+	BackendURL         string
+	ClientID           string
+	ClientIDs          func() []string
+	GpuIDs             []string // indexed by physical device ID
+	GpuNames           []string // indexed by physical device ID
+	TotalGpuCount      int
+	OnCeiling          CeilingCallback
+	Inference          inference.Scanner
+	MonitoredDeviceIDs []int
+}
+
+type Reporter struct {
+	config     ReporterConfig
+	scanner    inference.Scanner
+	vllmStats  *vllmScraper
+	mu         sync.Mutex
+	windowBuf  []MetricsSnapshot
+	inflight   bool
+	cancelFunc context.CancelFunc
+}
+
+func New(config ReporterConfig) *Reporter {
+	if os.Getenv(disableEnvVar) == "1" {
+		return nil
+	}
+
+	backendURL := config.BackendURL
+	if backendURL == "" {
+		backendURL = os.Getenv(backendURLEnvVar)
+	}
+	if backendURL == "" {
+		backendURL = DefaultBackendURL
+	}
+	config.BackendURL = backendURL
+
+	return &Reporter{
+		config:    config,
+		scanner:   config.Inference,
+		vllmStats: newVllmScraper(2 * time.Second),
+	}
+}
+
+func (r *Reporter) Observe(snapshot MetricsSnapshot) {
+	r.mu.Lock()
+	r.windowBuf = append(r.windowBuf, snapshot)
+	r.mu.Unlock()
+}
+
+func (r *Reporter) Start(ctx context.Context) {
+	ctx, r.cancelFunc = context.WithCancel(ctx)
+
+	jitterMs := hashToInt(r.config.ClientID) % 5000
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(time.Duration(jitterMs) * time.Millisecond):
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.tick(ctx)
+		}
+	}
+}
+
+func (r *Reporter) Stop() {
+	if r.cancelFunc != nil {
+		r.cancelFunc()
+	}
+}
+
+func (r *Reporter) tick(ctx context.Context) {
+	r.mu.Lock()
+	skip := r.inflight
+	var window []MetricsSnapshot
+	if !skip {
+		r.inflight = true
+		window = r.windowBuf
+		r.windowBuf = nil
+	}
+	r.mu.Unlock()
+
+	if skip {
+		return
+	}
+
+	defer func() {
+		r.mu.Lock()
+		r.inflight = false
+		r.mu.Unlock()
+	}()
+
+	if len(window) == 0 {
+		return
+	}
+
+	discoveryGPUs := r.config.MonitoredDeviceIDs
+	if len(discoveryGPUs) == 0 {
+		seen := make(map[int]bool)
+		for _, snap := range window {
+			for _, gpu := range snap.GPUs {
+				if !seen[gpu.DeviceID] {
+					seen[gpu.DeviceID] = true
+					discoveryGPUs = append(discoveryGPUs, gpu.DeviceID)
+				}
+			}
+		}
+	}
+
+	var attributions map[int]inference.Attribution
+	if r.scanner != nil {
+		var err error
+		attributions, err = r.scanner.Scan(ctx, discoveryGPUs)
+		if err != nil {
+			slog.Debug("metrics: scan error", "err", err)
+			return
+		}
+	}
+
+	type agg struct {
+		computeSum, memorySum                          float64
+		solCount                                       int
+		pcieTxSum, pcieRxSum, nvlinkTxSum, nvlinkRxSum float64
+		bwCount                                        int
+	}
+	byID := make(map[int]*agg)
+	for _, snap := range window {
+		for _, gpu := range snap.GPUs {
+			a := byID[gpu.DeviceID]
+			if a == nil {
+				a = &agg{}
+				byID[gpu.DeviceID] = a
+			}
+			if gpu.SOL.Valid {
+				a.computeSum += gpu.SOL.ComputePct
+				a.memorySum += gpu.SOL.MemoryPct
+				a.solCount++
+			}
+			if gpu.Bandwidth.Valid {
+				a.pcieTxSum += gpu.Bandwidth.PCIeTxBps
+				a.pcieRxSum += gpu.Bandwidth.PCIeRxBps
+				a.nvlinkTxSum += gpu.Bandwidth.NVLinkTxBps
+				a.nvlinkRxSum += gpu.Bandwidth.NVLinkRxBps
+				a.bwCount++
+			}
+		}
+	}
+
+	gpus := make([]MetricsGpu, 0, len(discoveryGPUs))
+	for _, deviceID := range discoveryGPUs {
+		gpuID := ""
+		gpuName := ""
+		if deviceID >= 0 && deviceID < len(r.config.GpuIDs) {
+			gpuID = r.config.GpuIDs[deviceID]
+		}
+		if deviceID >= 0 && deviceID < len(r.config.GpuNames) {
+			gpuName = r.config.GpuNames[deviceID]
+		}
+
+		var computePct, memoryPct, pcieGBs, nvlinkGBs float64
+		if a := byID[deviceID]; a != nil {
+			if a.solCount > 0 {
+				computePct = a.computeSum / float64(a.solCount)
+				memoryPct = a.memorySum / float64(a.solCount)
+			}
+			if a.bwCount > 0 {
+				pcieGBs = (a.pcieTxSum + a.pcieRxSum) / float64(a.bwCount) / 1e9
+				nvlinkGBs = (a.nvlinkTxSum + a.nvlinkRxSum) / float64(a.bwCount) / 1e9
+			}
+		}
+
+		var modelName *string
+		if att, ok := attributions[deviceID]; ok && att.ModelID != "" {
+			m := att.ModelID
+			modelName = &m
+		}
+
+		gpus = append(gpus, MetricsGpu{
+			Index:      deviceID,
+			GpuID:      gpuID,
+			GpuModel:   gpuName,
+			ModelName:  modelName,
+			ComputePct: math.Round(computePct*100) / 100,
+			MemoryPct:  math.Round(memoryPct*100) / 100,
+			PcieGBs:    math.Round(pcieGBs*10000) / 10000,
+			NvlinkGBs:  math.Round(nvlinkGBs*10000) / 10000,
+		})
+	}
+
+	if len(gpus) == 0 {
+		return
+	}
+
+	payload := MetricsPayload{
+		SchemaVersion: 2,
+		HostID:        r.config.ClientID,
+		ClientIDs:     r.clientIDs(),
+		SampledAtMs:   window[len(window)-1].Timestamp.UnixMilli(),
+		Mode:          "native",
+		GpuCount:      r.config.TotalGpuCount,
+		GPUs:          gpus,
+		Workloads:     r.scrapeWorkloads(ctx, attributions),
+	}
+
+	r.postMetrics(ctx, &payload)
+}
+
+// scrapeWorkloads is best-effort: models without usable stats are omitted.
+// Multiple endpoints serving the same model are scraped concurrently and
+// merged into one per-model workload.
+func (r *Reporter) scrapeWorkloads(ctx context.Context, attributions map[int]inference.Attribution) []MetricsWorkload {
+	if r.vllmStats == nil {
+		return nil
+	}
+	type pair struct{ model, url string }
+	pairs := map[pair]bool{}
+	live := map[string]bool{}
+	for _, att := range attributions {
+		if att.ModelID != "" && att.Endpoint.URL != "" {
+			pairs[pair{att.ModelID, att.Endpoint.URL}] = true
+			live[att.Endpoint.URL+"|"+att.ModelID] = true
+		}
+	}
+	r.vllmStats.prune(live)
+	if len(pairs) == 0 {
+		return nil
+	}
+
+	scrapeCtx, cancel := context.WithTimeout(ctx, scrapeBudget)
+	defer cancel()
+
+	var mu sync.Mutex
+	byModel := map[string][]MetricsWorkload{}
+	var wg sync.WaitGroup
+	for p := range pairs {
+		wg.Add(1)
+		go func(p pair) {
+			defer wg.Done()
+			if w, ok := r.vllmStats.Scrape(scrapeCtx, p.url, p.model); ok {
+				mu.Lock()
+				byModel[p.model] = append(byModel[p.model], *w)
+				mu.Unlock()
+			}
+		}(p)
+	}
+	wg.Wait()
+
+	models := make([]string, 0, len(byModel))
+	for m := range byModel {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+
+	out := make([]MetricsWorkload, 0, len(models))
+	for _, m := range models {
+		out = append(out, mergeWorkloads(byModel[m]))
+	}
+	return out
+}
+
+func mergeWorkloads(ws []MetricsWorkload) MetricsWorkload {
+	if len(ws) == 1 {
+		return ws[0]
+	}
+	merged := MetricsWorkload{ModelName: ws[0].ModelName}
+	var isl, osl []MetricsHistogram
+	var islWeighted, oslWeighted float64
+	for _, w := range ws {
+		islWeighted += w.IslMean * float64(w.IslHistogram.Count)
+		oslWeighted += w.OslMean * float64(w.OslHistogram.Count)
+		isl = append(isl, w.IslHistogram)
+		osl = append(osl, w.OslHistogram)
+		merged.ConcurrencyMean += w.ConcurrencyMean
+		merged.ConcurrencyMax += w.ConcurrencyMax
+		merged.EngineCount += w.EngineCount
+		merged.WindowMs = max(merged.WindowMs, w.WindowMs)
+	}
+	merged.IslHistogram = mergeHistograms(isl)
+	merged.OslHistogram = mergeHistograms(osl)
+	if merged.IslHistogram.Count > 0 {
+		merged.IslMean = round2(islWeighted / float64(merged.IslHistogram.Count))
+	}
+	if merged.OslHistogram.Count > 0 {
+		merged.OslMean = round2(oslWeighted / float64(merged.OslHistogram.Count))
+	}
+	merged.ConcurrencyMean = round2(merged.ConcurrencyMean)
+	return merged
+}
+
+func mergeHistograms(hs []MetricsHistogram) MetricsHistogram {
+	type span struct{ lower, upper int }
+	counts := map[span]int{}
+	total := 0
+	for _, h := range hs {
+		total += h.Count
+		for _, b := range h.Bins {
+			counts[span{b.Lower, b.Upper}] += b.Count
+		}
+	}
+	spans := make([]span, 0, len(counts))
+	for sp := range counts {
+		spans = append(spans, sp)
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].lower < spans[j].lower })
+	h := MetricsHistogram{Count: total, Bins: make([]MetricsHistogramBin, 0, len(spans))}
+	for _, sp := range spans {
+		h.Bins = append(h.Bins, MetricsHistogramBin{Lower: sp.lower, Upper: sp.upper, Count: counts[sp]})
+	}
+	return h
+}
+
+func (r *Reporter) clientIDs() []string {
+	seen := map[string]struct{}{}
+	if r.config.ClientID != "" {
+		seen[r.config.ClientID] = struct{}{}
+	}
+	if r.config.ClientIDs != nil {
+		for _, id := range r.config.ClientIDs() {
+			if id != "" {
+				seen[id] = struct{}{}
+			}
+		}
+	}
+
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func (r *Reporter) postMetrics(ctx context.Context, payload *MetricsPayload) {
+	postCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		slog.Debug("metrics: post metrics marshal error", "err", err)
+		return
+	}
+
+	slog.Debug("metrics: post metrics request", "url", r.config.BackendURL+"/metrics", "body", string(body))
+	start := time.Now()
+	request, err := http.NewRequestWithContext(postCtx, http.MethodPost, r.config.BackendURL+"/metrics", bytes.NewReader(body))
+	if err != nil {
+		slog.Debug("metrics: post metrics request error", "err", err)
+		return
+	}
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := http.DefaultClient.Do(request)
+	slog.Debug("metrics: post metrics responded", "duration", time.Since(start))
+	if err != nil {
+		slog.Debug("metrics: post metrics response error", "err", err)
+		return
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		slog.Debug("metrics: post metrics response not ok", "status", response.StatusCode, "body", string(body))
+		return
+	}
+
+	var metricsResponse MetricsResponse
+	if err := json.NewDecoder(response.Body).Decode(&metricsResponse); err != nil {
+		slog.Debug("metrics: post metrics response decode error", "err", err)
+		return
+	}
+	slog.Debug("metrics: post metrics response ceilings", "response", metricsResponse)
+
+	if r.config.OnCeiling != nil {
+		perGPU := make(map[int]GpuCeiling)
+		for _, g := range metricsResponse.GpuCeilings {
+			perGPU[g.Index] = GpuCeiling{
+				Index:             g.Index,
+				ModelName:         g.ModelName,
+				ComputeSolCeiling: g.ComputeSolCeiling,
+			}
+		}
+		r.config.OnCeiling(perGPU)
+	}
+}
+
+func hashToInt(s string) int {
+	h := 0
+	for _, c := range s {
+		h = ((h << 5) - h + int(c))
+	}
+	if h < 0 {
+		h = -h
+	}
+	return h
+}
