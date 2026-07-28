@@ -34,6 +34,8 @@ Compare `compute_sol` and `attainable_live` per workload against
   `vllm bench serve` load generation; the report's server flags live here
 - `run_all.sh` the five workloads in parallel, one GPU and one utlz each
 - `analyze.py` throughput, steady-window SOL, and live ceiling per workload
+- `throughput.py` measured vs attainable tok/s per workload, converting the
+  live ceiling from utilization
 - `utlz_collector.py` internal, records the utlz feed
 
 ## Building utlz
