@@ -1,0 +1,30 @@
+endpoint: https://api.systalyze.com/v1/utilyze
+
+model                                 gpu     n     isl    osl   conc  attainable
+---------------------------------------------------------------------------------
+Qwen/Qwen3.5-4B                       A100    1     128   1024     32      16.25%
+Qwen/Qwen3.5-9B                       H100    1     256     64    128      94.75%
+Qwen/Qwen3.5-9B                       H200    1    1024    256     64      82.34%
+Qwen/Qwen3.5-9B                       H200    1   16384   1024      4      28.39%
+google/gemma-4-12B-it                 H200    1    1024    256     64      57.92%
+google/gemma-4-12B-it                 H100    1    2048    512     32      26.88%
+google/gemma-4-26B-A4B-it             H200    2    2048    512     32      15.12%
+google/gemma-4-26B-A4B-it             H200    2    1024    256     64      20.88%
+Qwen/Qwen3.5-35B-A3B                  H200    2     512    128    128      27.83%
+Qwen/Qwen3.5-35B-A3B                  H200    2    1024    256     64      19.02%
+Qwen/Qwen3.5-35B-A3B                  A100    2    4096    256     32      40.15%
+google/gemma-4-31b-it                 H200    1    1024    256     64      62.23%
+google/gemma-4-31b-it                 H100    2    8192    512     16      92.36%
+Qwen/Qwen3.5-122B-A10B                H200    4    1024    256     64      26.52%
+Qwen/Qwen3.5-122B-A10B                H200    4   16384   1024     16      49.11%
+Qwen/Qwen3.5-397B-A17B                H200    8     512    128    128      40.65%
+Qwen/Qwen3.5-397B-A17B                H200    8    1024    256     64      26.66%
+openai/gpt-oss-20b                    H200    1    1024    256     64      68.04%
+openai/gpt-oss-20b                    H100    1    8192    512     16      46.26%
+openai/gpt-oss-120b                   H200    4    1024    256     64      52.80%
+openai/gpt-oss-120b                   H200    4   16384   1024     16      79.70%
+meta-llama/Llama-3.1-8B-Instruct      H200    1    2048    512     32      40.03%
+microsoft/phi-4                       H200    1    1024    256     32      51.89%
+deepseek-ai/DeepSeek-R1               H200    8     512    128    128      92.13%
+
+attainable range: 15.12% – 94.75%
