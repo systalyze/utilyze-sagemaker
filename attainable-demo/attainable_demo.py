@@ -10,6 +10,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 UTLZ_URL = "https://api.systalyze.com/v1/utilyze"
+USER_AGENT = "utilyze-attainable-demo/1.0 (+https://github.com/systalyze/utilyze-sagemaker)"
 
 H200 = "NVIDIA H200"
 H100 = "NVIDIA H100 80GB HBM3"
@@ -96,7 +97,7 @@ def attainable_sol(payload, timeout=45):
     request = urllib.request.Request(
         f"{UTLZ_URL}/metrics",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
